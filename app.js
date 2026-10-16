@@ -5,7 +5,6 @@ const SLOTS = ['PG', 'SG', 'SF', 'PF', 'C'];
 const UNITS = ['starters', 'bench'];
 const UNIT_LABELS = { starters: 'Starting five', bench: 'Second unit' };
 const ROSTER_SIZE = SLOTS.length * UNITS.length;
-const MAX_PER_ERA = 10;
 const RESPINS_PER_UNIT = 1;    // each respin button can be used once per unit
 const QUALIFY_GAMES = 20;      // players with fewer games for the team sort after everyone else
 // Projected record: each player's production is points + rebounds + assists
@@ -17,8 +16,9 @@ const BENCH_WEIGHT = 0.25;
 // beyond what drafting the top scorer on random pulls reaches.
 const WINS_MIDPOINT = 34.0;
 const WINS_SPREAD = 1.48;
-const SAVE_KEY = 'nba-dynasty-draft-v5';
-const OLD_SAVE_KEY = '82and0-draft-v5'; // same format, saved before the rename
+const SAVE_KEY = 'hoop-dynasty-draft-v5';
+// Same format, saved under the game's earlier names
+const OLD_SAVE_KEYS = ['nba-dynasty-draft-v5', '82and0-draft-v5'];
 
 const SORTS = { ppg: 'PPG', rpg: 'RPG', apg: 'APG', spg: 'SPG', bpg: 'BPG' };
 
@@ -41,8 +41,9 @@ function freshRespins() {
 }
 
 const state = {
-  phase: 'build',          // build | spinning | pick | done
-  pool: Object.fromEntries(ERAS.map(e => [e, 0])),
+  screen: 'start',         // start | game (not saved: every visit opens on the start screen)
+  phase: 'load',           // load (era reel) | ready | spinning | pick | done
+  pool: Object.fromEntries(ERAS.map(e => [e, 0])), // era -> 1 if selected for the draft, else 0
   era: null,
   team: null,
   respins: freshRespins(), // unit -> { era, team } respins left
@@ -105,10 +106,11 @@ function save() {
 
 function restore() {
   try {
-    const saved = JSON.parse(localStorage.getItem(SAVE_KEY) || localStorage.getItem(OLD_SAVE_KEY));
+    const saved = JSON.parse([SAVE_KEY, ...OLD_SAVE_KEYS].map(k => localStorage.getItem(k)).find(Boolean) || 'null');
     if (!saved || !saved.roster || !saved.pool) return;
     if (saved.phase === 'pick' && !(DATA[saved.era] && DATA[saved.era][saved.team])) return;
-    for (const e of ERAS) state.pool[e] = Math.min(MAX_PER_ERA, Math.max(0, saved.pool[e] | 0));
+    // Each era is in or out (older saves could load an era several times).
+    for (const e of ERAS) state.pool[e] = saved.pool[e] > 0 ? 1 : 0;
     for (const u of UNITS) for (const s of SLOTS) {
       const entry = (saved.roster[u] && saved.roster[u][s]) || null;
       // Take positions from the current data so rule changes reach drafted players.
@@ -122,17 +124,26 @@ function restore() {
     }
     state.era = saved.era;
     state.team = saved.team;
-    state.phase = ['build', 'pick', 'done'].includes(saved.phase) ? saved.phase : 'build';
+    // Saves from before the start/load screens used 'build' for "ready to pull".
+    const phase = saved.phase === 'build' ? (totalSlots() ? 'ready' : 'load') : saved.phase;
+    state.phase = ['load', 'ready', 'pick', 'done'].includes(phase) ? phase : 'load';
   } catch (e) { /* corrupt or unavailable save: start fresh */ }
 }
 
+function hasProgress() {
+  return state.phase !== 'load' || totalSlots() > 0 || filledCount() > 0;
+}
+
+// New draft: clear everything and go to the era reel.
 function resetDraft() {
   state.roster = { starters: emptyUnit(), bench: emptyUnit() };
   ERAS.forEach(e => state.pool[e] = 0);
   state.era = state.team = null;
   state.respins = freshRespins();
-  state.phase = 'build';
+  state.phase = 'load';
+  state.screen = 'game';
   render();
+  window.scrollTo({ top: 0 });
 }
 
 const $ = sel => document.querySelector(sel);
@@ -142,26 +153,9 @@ function totalSlots() {
   return ERAS.reduce((n, e) => n + state.pool[e], 0);
 }
 
-// Expand the pool into reel symbols. Smooth weighted round-robin keeps
-// duplicate selections as separate symbols, interleaved with other eras.
+// The era reel: one symbol per selected era, so each is equally likely.
 function buildSlots() {
-  const total = totalSlots();
-  const credit = Object.fromEntries(ERAS.map(e => [e, 0]));
-  const slots = [];
-  for (let i = 0; i < total; i++) {
-    let best = null;
-    for (const e of ERAS) {
-      credit[e] += state.pool[e];
-      if (state.pool[e] && (best === null || credit[e] > credit[best])) best = e;
-    }
-    credit[best] -= total;
-    slots.push(best);
-  }
-  return slots;
-}
-
-function pct(n, total) {
-  return total ? Math.round((n / total) * 100) : 0;
+  return ERAS.filter(e => state.pool[e]);
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +190,6 @@ function renderRoster() {
   const n = filledCount();
   const done = n >= ROSTER_SIZE;
   $('#roundTag').textContent = done ? 'Draft complete' : `Round ${n + 1} of ${ROSTER_SIZE} · ${UNIT_LABELS[currentUnit()]}`;
-  $('#newBtn').hidden = n === 0 && state.phase === 'build' && !totalSlots();
   $('#roster').innerHTML = UNITS.map(unit => {
     const prod = unitProduction(unit);
     const drafting = !done && currentUnit() === unit;
@@ -227,92 +220,93 @@ function renderRoster() {
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
+// Screens, in order: start → load the era reel (once per draft) → slot machine
+// (pull, pick, repeat) → final record. The roster appears from the slot
+// machine on.
 function render() {
   save();
-  renderRoster();
+  const atMachine = state.screen === 'game' && state.phase !== 'load';
+  $('#roster').hidden = !atMachine;
+  $('#headerRight').hidden = !atMachine;
+  if (atMachine) renderRoster();
+  if (state.screen === 'start') return renderStart();
+  if (state.phase === 'load') return renderLoad();
   if (state.phase === 'done') return renderFinal();
-
-  const locked = state.phase !== 'build';
-  const total = totalSlots();
-
-  main.innerHTML = `
-    <div class="stage">
-      <div class="card">
-        <h2>Load the era reel</h2>
-        <p class="hint">Each selection adds one symbol to the era reel. Add an era more than once to raise its odds.</p>
-        <div class="add-row">
-          ${ERAS.map(e => `<button data-add="${e}" ${locked || state.pool[e] >= MAX_PER_ERA ? 'disabled' : ''}>${e.slice(2)} +</button>`).join('')}
-        </div>
-        <div class="era-list">
-          ${ERAS.map(e => {
-            const n = state.pool[e];
-            const p = pct(n, total);
-            return `<div class="era-row" data-era="${e}">
-              <span class="swatch" style="background:${ERA_COLORS[e]}"></span>
-              <span class="era-name">${e}</span>
-              <span class="stepper">
-                <button data-sub="${e}" ${locked || !n ? 'disabled' : ''} aria-label="Remove ${e}">−</button>
-                <span class="count ${n ? 'on' : ''}">×${n}</span>
-                <button data-add="${e}" ${locked || n >= MAX_PER_ERA ? 'disabled' : ''} aria-label="Add ${e}">+</button>
-              </span>
-              <input type="range" class="slider" data-slide="${e}" min="0" max="${MAX_PER_ERA}" step="1" value="${n}"
-                style="--c:${ERA_COLORS[e]};--fill:${(n / MAX_PER_ERA) * 100}%" ${locked ? 'disabled' : ''} aria-label="${e} symbols">
-              <span class="pct ${n ? '' : 'zero'}">${p}%</span>
-            </div>`;
-          }).join('')}
-        </div>
-        <div class="total">
-          <span>${total} symbol${total === 1 ? '' : 's'} on the era reel</span>
-          <button class="btn-ghost" id="clearBtn" ${locked || !total ? 'disabled' : ''}>Clear all</button>
-        </div>
-      </div>
-
-      <div class="card machine-card">
-        ${machineHTML()}
-      </div>
-    </div>
-    <div class="players card" id="players" ${state.phase === 'pick' ? '' : 'hidden'}>${playersHTML()}</div>
-  `;
-
-  main.querySelectorAll('[data-add]').forEach(b => b.onclick = () => {
-    state.pool[b.dataset.add] = Math.min(MAX_PER_ERA, state.pool[b.dataset.add] + 1);
-    render();
-  });
-  // While dragging, update the builder in place (a full render would replace
-  // the slider mid-drag); re-render once the drag is released.
-  main.querySelectorAll('[data-slide]').forEach(r => {
-    r.oninput = () => { state.pool[r.dataset.slide] = +r.value; updateBuilder(); };
-    r.onchange = () => {
-      render();
-      main.querySelector(`[data-slide="${r.dataset.slide}"]`).focus(); // keep keyboard control
-    };
-  });
-  main.querySelectorAll('[data-sub]').forEach(b => b.onclick = () => { state.pool[b.dataset.sub]--; render(); });
-  $('#clearBtn').onclick = () => { ERAS.forEach(e => state.pool[e] = 0); render(); };
-  bindMachine();
-  bindPlayers();
+  renderMachine();
 }
 
-// Refresh counts, odds and the idle era reel without rebuilding the builder's DOM.
-function updateBuilder() {
+function renderStart() {
+  const resume = hasProgress();
+  main.innerHTML = `
+    <div class="card start">
+      <p class="tagline">Draft a ten-man roster from 65 years of NBA history and chase an 82–0 season.</p>
+      <ol class="steps">
+        <li><b>Load the era reel</b> — pick which decades can come up in your draft.</li>
+        <li><b>Pull the slot machine</b> — it lands on an era and a team.</li>
+        <li><b>Draft a player</b> from that team's roster, by their real stats. Repeat for your starting five, then your bench.</li>
+      </ol>
+      <div class="start-actions">
+        ${resume
+          ? `<button class="btn-primary" id="continueBtn">Continue draft</button>
+             <button class="btn-ghost" id="startBtn">Start a new game</button>`
+          : '<button class="btn-primary" id="startBtn">Start game</button>'}
+      </div>
+    </div>`;
+  if (resume) $('#continueBtn').onclick = () => { state.screen = 'game'; render(); };
+  $('#startBtn').onclick = () => {
+    if (!resume || confirm('Start a new game? Your saved draft will be cleared.')) resetDraft();
+  };
+}
+
+// Each checked era goes on the reel once, so every picked era is equally likely.
+function renderLoad() {
   const total = totalSlots();
-  for (const e of ERAS) {
-    const n = state.pool[e];
-    const row = main.querySelector(`.era-row[data-era="${e}"]`);
-    const count = row.querySelector('.count');
-    count.textContent = `×${n}`;
-    count.classList.toggle('on', n > 0);
-    const pctEl = row.querySelector('.pct');
-    pctEl.textContent = `${pct(n, total)}%`;
-    pctEl.classList.toggle('zero', !n);
-    row.querySelector('[data-sub]').disabled = !n;
-    row.querySelector('[data-add]').disabled = n >= MAX_PER_ERA;
-    main.querySelector(`.add-row [data-add="${e}"]`).disabled = n >= MAX_PER_ERA;
-    row.querySelector('.slider').style.setProperty('--fill', `${(n / MAX_PER_ERA) * 100}%`);
-  }
-  main.querySelector('.total span').textContent = `${total} symbol${total === 1 ? '' : 's'} on the era reel`;
-  $('#clearBtn').disabled = $('#pullBtn').disabled = !total;
-  setStrip($('#eraStrip'), idleEraSymbols(), 0);
+  main.innerHTML = `
+    <div class="card solo">
+      <h2>Load the era reel</h2>
+      <p class="hint">Check the eras you want in your draft. Each one is equally likely to come up, and this reel is used for your whole draft.</p>
+      <div class="era-picks">
+        ${ERAS.map(e => `<label class="era-pick" style="--c:${ERA_COLORS[e]}">
+            <input type="checkbox" data-era="${e}" ${state.pool[e] ? 'checked' : ''}>
+            <span class="swatch" style="background:${ERA_COLORS[e]}"></span>
+            <span class="era-name">${e}</span>
+          </label>`).join('')}
+      </div>
+      <div class="total">
+        <span>${total ? `${total} era${total === 1 ? '' : 's'} selected` : 'No eras selected'}</span>
+        <span class="bulk">
+          <button class="btn-ghost" id="allBtn" ${total === ERAS.length ? 'disabled' : ''}>Select all</button>
+          <button class="btn-ghost" id="clearBtn" ${!total ? 'disabled' : ''}>Clear</button>
+        </span>
+      </div>
+      <button class="btn-primary" id="toMachineBtn" ${!total ? 'disabled' : ''}>Continue to slot machine</button>
+    </div>`;
+
+  main.querySelectorAll('[data-era]').forEach(box => box.onchange = () => {
+    state.pool[box.dataset.era] = box.checked ? 1 : 0;
+    render();
+    main.querySelector(`[data-era="${box.dataset.era}"]`).focus(); // keep keyboard focus after re-render
+  });
+  $('#allBtn').onclick = () => { ERAS.forEach(e => state.pool[e] = 1); render(); };
+  $('#clearBtn').onclick = () => { ERAS.forEach(e => state.pool[e] = 0); render(); };
+  $('#toMachineBtn').onclick = () => {
+    if (!totalSlots()) return;
+    state.phase = 'ready';
+    render();
+    window.scrollTo({ top: 0 });
+  };
+}
+
+function renderMachine() {
+  const eras = ERAS.filter(e => state.pool[e]).join(' · ');
+  main.innerHTML = `
+    <div class="card machine-card solo">
+      ${machineHTML()}
+      <p class="hint reel-odds">Your eras: ${eras}</p>
+    </div>
+    <div class="players card" id="players" ${state.phase === 'pick' ? '' : 'hidden'}>${playersHTML()}</div>`;
+  bindMachine();
+  bindPlayers();
 }
 
 // ---------------------------------------------------------------------------
@@ -344,7 +338,7 @@ function respinBlocker(kind) {
   if (!state.respins[currentUnit()][kind]) return `Used for the ${UNIT_LABELS[currentUnit()].toLowerCase()}`;
   if (kind === 'era') {
     const others = buildSlots().filter(e => e !== state.era);
-    if (!others.length) return 'Load another era to respin';
+    if (!others.length) return 'Only one era in your draft';
     if (!others.some(e => DATA[e][state.team])) return `${state.team} didn't play in your other eras`;
   }
   return '';
@@ -363,7 +357,7 @@ function machineHTML() {
   const pulled = state.phase === 'pick';
   const total = totalSlots();
   return `<div class="machine ${pulled ? 'win' : ''}" id="machine">
-      <div class="marquee"><span class="bulbs"></span>NBA Dynasty<span class="bulbs"></span></div>
+      <div class="marquee"><span class="bulbs"></span>Hoop Dynasty<span class="bulbs"></span></div>
       <div class="reels">
         <div class="reel reel-era"><div class="strip" id="eraStrip"></div></div>
         <div class="reel reel-team"><div class="strip" id="teamStrip"></div></div>
@@ -376,7 +370,7 @@ function machineHTML() {
     ${pulled
       ? `<div class="respins">${respinButton('era')}${respinButton('team')}</div>
          <p class="hint respin-note">A new era keeps the team (only eras it played in). A new team keeps the era.</p>`
-      : `<button class="btn-primary" id="pullBtn" ${state.phase !== 'build' || !total ? 'disabled' : ''}>Pull</button>`}`;
+      : `<button class="btn-primary" id="pullBtn" ${state.phase !== 'ready' || !total ? 'disabled' : ''}>Pull</button>`}`;
 }
 
 function bindMachine() {
@@ -416,9 +410,8 @@ function spinStrip(strip, symbols, stop, ms) {
 // mode 'era': same team, new era (never the current one, and only eras the
 //             team played in). Only the era reel spins.
 // mode 'team': same era, new team (never the current one). Only the team reel spins.
-// The era symbol is picked uniformly from the weighted strip, so each era's
-// odds equal its share of symbols (among the eras still eligible); the
-// spinning reels are then animated onto exactly the picked results.
+// The era is picked uniformly from the selected eras (among those still
+// eligible); the spinning reels are then animated onto exactly the picked results.
 function pull(mode) {
   const slots = buildSlots();
   const spinEra = mode !== 'team';
@@ -440,7 +433,7 @@ function pull(mode) {
   render();
 
   if (spinEra) {
-    // Several loops of the weighted strip, landing on the picked symbol.
+    // Several loops of the era strip, landing on the picked symbol.
     const loops = Math.max(4, Math.ceil(30 / slots.length));
     const symbols = Array.from({ length: loops + 1 }, () => slots).flat().map(eraSymbol);
     spinStrip($('#eraStrip'), symbols, loops * slots.length + eraIndex, ERA_SPIN_MS);
@@ -561,7 +554,7 @@ function pickPlayer(i, slot) {
     ...Object.fromEntries(STAT_KEYS.map(k => [k, p[k]])),
   };
   state.era = state.team = null;
-  state.phase = filledCount() >= ROSTER_SIZE ? 'done' : 'build';
+  state.phase = filledCount() >= ROSTER_SIZE ? 'done' : 'ready';
   render();
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
@@ -588,7 +581,7 @@ function renderFinal() {
 }
 
 $('#newBtn').onclick = () => {
-  if (confirm('Start a new draft? Your current picks will be cleared.')) resetDraft();
+  if (confirm('Start a new draft? Your current picks and era reel will be cleared.')) resetDraft();
 };
 restore();
 render();
